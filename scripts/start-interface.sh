@@ -20,10 +20,10 @@ trap on_exit EXIT
 
 # Port of the CLI terminal workflow's "Start the interface" step. Username,
 # password and shell were checked by credentials.sh (no line breaks). The
-# login also reaches this step as step env (ASD_BASIC_AUTH_*, ASD_TTYD_*, ASD_CODESERVER_*), so the
-# CLI does not depend on reading it back from .env.
+# login also reaches this step as step env (VIA_BASIC_AUTH_*, VIA_TTYD_*,
+# VIA_CODESERVER_*), so the CLI does not depend on reading it back from .env.
 
-ci_group_start "Starting the session interface (${SESSION_INTERFACE})"
+ci_group_start "Preparing the session (interface: ${SESSION_INTERFACE})"
 
 # A .env value, double-quoted with \ " $ ` escaped: the CLI's .env reader and
 # bash `source` both read back exactly what was written.
@@ -38,24 +38,34 @@ envq() {
 
 # Seed .env first: via init keeps values that are already there. Appended, so
 # a .env the repository already has is kept. The session login is the
-# project login (ASD_BASIC_AUTH_*): Caddy's login in front of the terminal and
-# of the published route is that one, and without it `via init` generates a
-# hub login the laptop does not know (every request answered 401).
+# project login: Caddy's login in front of the terminal and of the published
+# route is that one, and without it `via init` generates a hub login the
+# laptop does not know (every request answered 401). The keys are the ones
+# the CLI itself writes into .env and looks for when it fills in what is
+# missing: a .env key is not an environment variable, so the VIA_ names do
+# not apply to it.
 # Keep the repository's own .env to restore at the end (cleanup.sh).
 # What via init writes besides .env (its .env backups, .gitignore lines,
-# workspace/, .asd/) is noted first, so the cleanup takes back only that.
+# workspace/, its runtime state folder) is noted first, so the cleanup takes
+# back only that.
 note_checkout_before
 if [ -f .env ]; then
   cp -p .env "${STATE_DIR}/env.backup"
 fi
 touch "${STATE_DIR}/env-seeded"
 note_caddy_before
+# Without a password input (interface: none, every service public) the
+# password is the random one credentials.sh made for this run.
 {
-  echo "ASD_BASIC_AUTH_USERNAME=${SESSION_USERNAME}"
-  echo "ASD_BASIC_AUTH_PASSWORD=$(envq "$SESSION_PASSWORD")"
-  echo "ASD_TTYD_USERNAME=${SESSION_USERNAME}"
-  echo "ASD_TTYD_PASSWORD=$(envq "$SESSION_PASSWORD")"
-  echo "ASD_TTYD_SHELL_CMD=$(envq "$SESSION_SHELL")"
+  if [ -n "${SESSION_PASSWORD:-}" ]; then
+    echo "ASD_BASIC_AUTH_USERNAME=${SESSION_USERNAME}"
+    echo "ASD_BASIC_AUTH_PASSWORD=$(envq "$SESSION_PASSWORD")"
+  fi
+  if [ "$SESSION_INTERFACE" != "none" ]; then
+    echo "ASD_TTYD_USERNAME=${SESSION_USERNAME}"
+    echo "ASD_TTYD_PASSWORD=$(envq "$SESSION_PASSWORD")"
+    echo "ASD_TTYD_SHELL_CMD=$(envq "$SESSION_SHELL")"
+  fi
   if [ "$SESSION_INTERFACE" = "codeserver" ]; then
     echo "ASD_CODESERVER_AUTH=password"
     echo "ASD_CODESERVER_PASSWORD=$(envq "$SESSION_PASSWORD")"
@@ -63,6 +73,16 @@ note_caddy_before
 } >> .env
 chmod 600 .env
 via init --yes
+
+# interface: none starts no terminal and no VS Code: only Caddy (via expose
+# starts it) and the exposures, in expose.sh.
+if [ "$SESSION_INTERFACE" = "none" ]; then
+  ci_set_output "target" ""
+  ci_set_output "port" ""
+  echo "Interface: none (expose only)"
+  ci_group_end
+  exit 0
+fi
 
 echo "${SESSION_INTERFACE}" > "${STATE_DIR}/interface"
 
@@ -84,7 +104,7 @@ if [ "$SESSION_INTERFACE" != "codeserver" ] && [ "$CI_RUNNER_OS" != "Windows" ];
 else
   PORT=$(grep -E "^${PORT_VAR}=" .env | tail -1 | cut -d= -f2-)
   if [ -z "$PORT" ]; then
-    ci_error "${PORT_VAR} is not in .env after the interface started."
+    ci_error "The interface's port is not in .env after it started."
     exit 1
   fi
   TARGET="$PORT"

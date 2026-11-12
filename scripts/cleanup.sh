@@ -13,10 +13,11 @@
 #
 #   STATE_DIR      per-session state (credentials.sh)
 #   SESSION_NAME   the published name
-#   DEPLOY_ID      GitHub deployment to mark inactive (optional)
+#   DEPLOY_ID      GitHub deployment to mark inactive (optional; else
+#                  STATE_DIR/deploy-id, which the post step relies on)
 #   CLEANUP_BY     who calls, for the log ("keep-alive (cancelled)", ...)
 #
-# Markers: exposed, interface (terminal|codeserver), caddy-before,
+# Markers: exposed, exposures (+ exposure-urls), interface (terminal|codeserver), caddy-before,
 # caddy-started,
 # env-seeded (+ env.backup), checkout-noted (+ checkout/), stop-failed,
 # tunnel-url.txt. Who ends it: ending, ended.
@@ -55,10 +56,43 @@ cleanup_log() {
   echo "[cleanup] $*"
 }
 
+# After an exposure is stopped the relay must answer 404 for its address.
+# Anything else is said loudly (a run warning), never passed over: 000 means
+# it could not be checked, any other status that something still answers.
+cleanup_not_gone() {
+  local code="${1:-000}" what="$2" msg
+  [ "$code" = "404" ] && return 0
+  if [ "$code" = "000" ]; then
+    msg="Could not confirm that ${what} is gone (no answer from the relay when checked)."
+  else
+    msg="${what} still answers HTTP ${code} after the exposure was stopped (404 expected)."
+  fi
+  cleanup_log "Warning: ${msg}"
+  if command -v ci_warning >/dev/null 2>&1; then ci_warning "$msg"; fi
+}
+
+# The folder the CLI keeps its project state in, in the checkout: newer CLIs
+# write .via, older ones the older name. The log never names the folder.
+CLI_STATE_DIRS=(.via .asd)
+# The comment the CLI puts above the .gitignore lines it appends.
+CLI_GITIGNORE_MARK='\(added by \.?(via|asd)\)'
+
+# How the log names a directory of the checkout: the CLI's state folder by
+# what it is, any other by its path.
+dir_label() {
+  local n
+  for n in "${CLI_STATE_DIRS[@]}"; do
+    if [ "$1" = "$n" ]; then echo "the CLI's runtime state"; return 0; fi
+  done
+  echo "${1}/"
+}
+
 # What `via init` writes into the checkout besides .env: a copy of .env before
 # each rewrite (.env.bak, .env.bak.1, ...: mode 0600, with the login in it),
 # lines appended to .gitignore, its runtime state in the workspace directory
-# (ASD_WORKSPACE_DIR, workspace/ in action.yml) and .asd/. Called in the
+# (VIA_WORKSPACE_DIR, workspace/ in action.yml) and the CLI's runtime state
+# folder in the checkout (CLI_STATE_DIRS: newer CLIs write the one, older
+# ones the other; both are noted, either is removed). Called in the
 # checkout before the action seeds .env: notes which of these the repository
 # already had, and keeps a copy of its backups and .gitignore, so the cleanup
 # removes or reverts only what the session added. `complete` is written last:
@@ -87,10 +121,10 @@ note_checkout_before() {
   fi
   : > "$snap/dirs"
   : > "$snap/had-dirs"
-  local ws="${ASD_WORKSPACE_DIR:-$PWD/workspace}"
+  local ws="${VIA_WORKSPACE_DIR:-$PWD/workspace}"
   # Windows: github.workspace is D:\a\..., Git Bash's PWD is /d/a/...
   if command -v cygpath >/dev/null 2>&1; then ws=$(cygpath -u "$ws"); fi
-  for d in "$ws" "$PWD/.asd"; do
+  for d in "$ws" "${CLI_STATE_DIRS[@]/#/$PWD/}"; do
     echo "$d" >> "$snap/dirs"
     if [ -e "$d" ] || [ -L "$d" ]; then echo "$d" >> "$snap/had-dirs"; fi
   done
@@ -119,20 +153,20 @@ restore_checkout() {
   local f
   for f in complete root had-files dirs had-dirs; do
     if [ ! -f "$snap/$f" ]; then
-      cleanup_log "Left the checkout's .env backups, .gitignore, workspace/ and .asd/ as they are: the note of what the repository had is incomplete (${f} missing), so nothing can be told apart."
+      cleanup_log "Left the checkout's .env backups, .gitignore, workspace/ and the CLI's runtime state as they are: the note of what the repository had is incomplete (${f} missing), so nothing can be told apart."
       return 0
     fi
   done
   root=$(cat "$snap/root")
   if [ -z "$root" ] || [ "$root" = / ] || [ ! -d "$root" ]; then
-    cleanup_log "Left the checkout's .env backups, .gitignore, workspace/ and .asd/ as they are: no usable checkout path in the note (${root:-empty})."
+    cleanup_log "Left the checkout's .env backups, .gitignore, workspace/ and the CLI's runtime state as they are: no usable checkout path in the note (${root:-empty})."
     return 0
   fi
   ( cd -- "$root" && restore_checkout_in_root "$state" "$snap" "$root" )
 }
 
 restore_checkout_in_root() {
-  local state="$1" snap="$2" root="$3" f d rel real failed=0
+  local state="$1" snap="$2" root="$3" f d rel real what failed=0
 
   # .env backups: the CLI's copies of the session .env hold the login.
   for f in .env.bak .env.bak.*; do
@@ -181,7 +215,7 @@ restore_checkout_in_root() {
     fi
   done < "$snap/had-files"
 
-  # .gitignore: via init appends its .env and .asd rules.
+  # .gitignore: via init appends its .env and runtime state rules.
   if [ -f "$snap/gitignore" ]; then
     local size appended=0
     size=$(wc -c < "$snap/gitignore" | tr -d ' ')
@@ -212,7 +246,7 @@ restore_checkout_in_root() {
       cleanup_log "Left .gitignore as it is: it changed beyond the lines via init appends (edited during the session?)."
     fi
   elif [ -f "$snap/no-gitignore" ] && [ -f .gitignore ]; then
-    if grep -q '(added by \.asd)' .gitignore; then
+    if grep -qE "$CLI_GITIGNORE_MARK" .gitignore; then
       rm -f .gitignore
       cleanup_log "Removed the .gitignore via init created (the repository had none)."
     else
@@ -225,25 +259,32 @@ restore_checkout_in_root() {
   while IFS= read -r d; do
     [ -n "$d" ] || continue
     rel="${d#"$root"/}"
+    what=$(dir_label "$rel")
     if grep -qxF -- "$d" "$snap/had-dirs"; then
-      cleanup_log "Left ${rel}/ in place: it was there before the session."
+      # The state folder the CLI did not write this time is just not there.
+      [ -e "$d" ] || [ -L "$d" ] || continue
+      cleanup_log "Left ${what} in place: it was there before the session."
       continue
     fi
     [ -e "$d" ] || [ -L "$d" ] || continue
     real=$(physical_path "$d")
     case "$real" in
       "$root"/?*) ;;
-      *) cleanup_log "Left ${d}: it is outside the checkout."; continue ;;
+      *) cleanup_log "Left ${what}: it is outside the checkout."; continue ;;
     esac
-    rel="${real#"$root"/}"
+    what=$(dir_label "${real#"$root"/}")
     if [ -f "$state/stop-failed" ]; then
-      cleanup_log "Left ${rel}/: $(cat "$state/stop-failed") failed, so a process may still run from it."
+      cleanup_log "Left ${what}: $(cat "$state/stop-failed") failed, so a process may still run from it."
       continue
     fi
     if rm -rf -- "$real"; then
-      cleanup_log "Removed ${rel}/ (the CLI's runtime state, created by this session)."
+      if [ "$what" = "the CLI's runtime state" ]; then
+        cleanup_log "Removed the CLI's runtime state (created by this session)."
+      else
+        cleanup_log "Removed ${what} (the CLI's runtime state, created by this session)."
+      fi
     else
-      cleanup_log "Warning: could not remove ${rel}/ completely."
+      cleanup_log "Warning: could not remove ${what} completely."
     fi
   done < "$snap/dirs"
 
@@ -262,17 +303,27 @@ cleanup_session() {
     cleanup_log "Nothing to do: ${state} does not exist (the session never got past the credentials step)."
     return 0
   fi
-  if [ -f "$state/ended" ] && [ ! -f "$state/exposed" ] && [ ! -f "$state/interface" ] \
+  if [ -f "$state/ended" ] && [ ! -f "$state/exposed" ] && [ ! -f "$state/exposures" ] && [ ! -f "$state/interface" ] \
      && [ ! -f "$state/caddy-started" ] && [ ! -f "$state/env-seeded" ] \
      && [ ! -f "$state/checkout-noted" ]; then
     cleanup_log "Nothing left to do: the session was already ended by $(cat "$state/ended")."
     return 0
   fi
 
+  # This session's own CLI (install-cli.sh: <state>/cli/bin, on Windows
+  # <state>/cli/home/bin; VIA_HOME <state>/cli/home): with two sessions in
+  # one job the job's PATH may lead to the other session's CLI.
+  local d
+  for d in "$state/cli/home/bin" "$state/cli/bin"; do
+    if [ -d "$d" ]; then PATH="$d:$PATH"; fi
+  done
+  export PATH
+  if [ -d "$state/cli/home" ]; then export VIA_HOME="$state/cli/home"; fi
+
   local did=0
 
   # Who ends the session, written before the first part: see the header.
-  if [ ! -f "$state/ending" ] && { [ -f "$state/exposed" ] || [ -f "$state/interface" ] \
+  if [ ! -f "$state/ending" ] && { [ -f "$state/exposed" ] || [ -f "$state/exposures" ] || [ -f "$state/interface" ] \
      || [ -f "$state/caddy-started" ] || [ -f "$state/env-seeded" ] \
      || [ -f "$state/checkout-noted" ]; }; then
     echo "${by} at $(date -u '+%H:%M:%S UTC')" > "$state/ending"
@@ -304,8 +355,48 @@ cleanup_session() {
       url=$(head -1 "$state/tunnel-url.txt")
       code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$url" 2>/dev/null || true)
       cleanup_log "The relay now answers HTTP ${code:-000} for the session address (401 while it was published)."
+      cleanup_not_gone "$code" "the session address"
     fi
     rm -f "$state/exposed"
+  fi
+
+  # 1b. The services of the expose input (expose.sh), one by one. A name
+  #     leaves the marker file once it is stopped, so a cleanup killed half
+  #     way leaves only the rest to the next caller.
+  if [ -f "$state/exposures" ]; then
+    did=1
+    local name url code listed rest names
+    # Read first: the file is rewritten as names are stopped.
+    names=$(cat "$state/exposures")
+    while IFS= read -r name <&4; do
+      [ -n "$name" ] || continue
+      if via expose stop "$name" >/dev/null 2>&1 < /dev/null; then
+        cleanup_log "Stopped the exposure '${name}' (via expose stop)."
+      else
+        cleanup_log "via expose stop '${name}' failed; the relay drops the address when the runner disconnects."
+      fi
+      if command -v jq >/dev/null 2>&1; then
+        listed=$(via expose list --json 2>/dev/null < /dev/null | jq -r --arg n "$name" \
+          'first(.exposed[]? | select(.id == $n or .name == $n) | .id) // empty' 2>/dev/null || true)
+        if [ -n "$listed" ]; then
+          cleanup_log "Warning: '${name}' is still in via expose list."
+        else
+          cleanup_log "'${name}' is no longer in via expose list."
+        fi
+      fi
+      url=""
+      if [ -f "$state/exposure-urls" ]; then
+        url=$(awk -F '\t' -v n="$name" '$1 == n { print $2; exit }' "$state/exposure-urls")
+      fi
+      if [ -n "$url" ] && command -v curl >/dev/null 2>&1; then
+        code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$url" 2>/dev/null || true)
+        cleanup_log "The relay now answers HTTP ${code:-000} for ${url}."
+        cleanup_not_gone "$code" "$url"
+      fi
+      rest=$(grep -vxF -- "$name" "$state/exposures" || true)
+      if [ -n "$rest" ]; then printf '%s\n' "$rest" > "$state/exposures"; else : > "$state/exposures"; fi
+    done 4<<< "$names"
+    rm -f "$state/exposures" "$state/exposure-urls"
   fi
 
   # 2. The interface started by start-interface.sh.
@@ -360,7 +451,7 @@ cleanup_session() {
   fi
 
   # 5. What via init added next to .env: its backups of .env (with the
-  #    login), its .gitignore lines, workspace/ and .asd/.
+  #    login), its .gitignore lines, workspace/ and its runtime state folder.
   #    The marker goes before the note it points to: a cleanup killed in
   #    between leaves no marker, never a marker without its note.
   if [ -f "$state/checkout-noted" ]; then
@@ -374,10 +465,15 @@ cleanup_session() {
   fi
 
   # 6. The deployment button.
-  if [ -n "${DEPLOY_ID:-}" ] && command -v ci_deactivate_deployment >/dev/null 2>&1; then
-    ci_deactivate_deployment "${DEPLOY_ID}"
-    cleanup_log "Marked deployment ${DEPLOY_ID} inactive."
+  local deploy_id="${DEPLOY_ID:-}"
+  if [ -z "$deploy_id" ] && [ -f "$state/deploy-id" ]; then
+    deploy_id=$(cat "$state/deploy-id")
   fi
+  if [ -n "$deploy_id" ] && command -v ci_deactivate_deployment >/dev/null 2>&1; then
+    ci_deactivate_deployment "${deploy_id}"
+    cleanup_log "Marked deployment ${deploy_id} inactive."
+  fi
+  rm -f "$state/deploy-id"
 
   rm -f "$state/tunnel-url.txt"
   if [ "$did" -eq 0 ] && [ -f "$state/ending" ]; then
